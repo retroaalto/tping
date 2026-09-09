@@ -1,0 +1,31 @@
+version: 2
+
+project_name: tping
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - tar.gz
+
+checksum:
+  name_template: checksums.txt
+
+brews:
+  - name: tping
+    repository:
+      owner: retroaalto
+      name: homebrew-tping
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/retroaalto/tping
+    description: Live terminal ping latency graph
+    license: Apache-2.0
+    test: |
+      assert_match "Usage of tping:", shell_output("#{bin}/tping -h")
