@@ -28,4 +28,7 @@ brews:
     description: Live terminal ping latency graph
     license: Apache-2.0
     test: |
-      assert_match "Usage of tping:", shell_output("#{bin}/tping -h")
+      assert_match "Usage of tping:", shell_output("#{bin}/tping -h 2>&1")
+    caveats: |
+      If tping reports a permission error, allow unprivileged ping sockets:
+        sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"

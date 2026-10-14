@@ -165,10 +165,14 @@ func (m *model) applyTrace(results []traceResult) tea.Cmd {
 		}
 		h := &m.hops[i]
 		h.ttl = result.ttl
-		if result.err == nil && result.ip != nil && (h.ip == nil || !h.ip.Equal(result.ip)) {
-			// A route change at this TTL starts a new hop identity. Do not
-			// combine its latency history with the router it replaced.
-			*h = hop{ttl: result.ttl, ip: result.ip}
+		if result.err == nil && result.ip != nil {
+			if h.ip == nil {
+				h.ip = result.ip
+			} else if !h.ip.Equal(result.ip) {
+				// A route change at this TTL starts a new hop identity. Do not
+				// combine its latency history with the router it replaced.
+				*h = hop{ttl: result.ttl, ip: result.ip}
+			}
 		}
 		h.sent++
 		if result.err == nil && result.ip != nil {
@@ -223,10 +227,10 @@ func (m model) View() string {
 	b.WriteString(m.renderGraph())
 	b.WriteString("\n\n")
 	if m.traceEvery > 0 {
-		if len(m.hops) > 0 {
-			b.WriteString(m.renderTraceTable())
-		} else if m.traceErr != nil {
+		if m.traceErr != nil {
 			b.WriteString(badStyle.Render("TRACE " + m.traceErr.Error()))
+		} else if len(m.hops) > 0 {
+			b.WriteString(m.renderTraceTable())
 		} else {
 			b.WriteString(mutedStyle.Render("TRACE discovering route…"))
 		}
@@ -296,16 +300,19 @@ func (m model) renderTraceTable() string {
 	var b strings.Builder
 	hostWidth, barWidth := m.traceColumnWidths()
 	header := fmt.Sprintf("%3s  %-*s  %6s  %-*s  %6s  %6s  %6s", "HOP", hostWidth, "HOST", "LOSS", barWidth, "LATENCY", "MIN", "AVG", "MAX")
-	b.WriteString(titleStyle.Render(header))
+	// Clip rows on terminals narrower than the minimum column widths so they
+	// do not wrap and break the row count.
+	clip := lipgloss.NewStyle().MaxWidth(max(m.width-4, 1))
+	b.WriteString(clip.Render(titleStyle.Render(header)))
 	b.WriteByte('\n')
 	rows := m.traceRowsAvailable()
 	for i, h := range m.hops {
 		if i == rows {
-			b.WriteString(mutedStyle.Render(fmt.Sprintf("… and %d more hops", len(m.hops)-i)))
+			b.WriteString(clip.Render(mutedStyle.Render(fmt.Sprintf("… and %d more hops", len(m.hops)-i))))
 			b.WriteByte('\n')
 			break
 		}
-		b.WriteString(m.renderTraceHop(h, hostWidth, barWidth))
+		b.WriteString(clip.Render(m.renderTraceHop(h, hostWidth, barWidth)))
 		b.WriteByte('\n')
 	}
 	return b.String()

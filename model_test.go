@@ -307,3 +307,51 @@ func TestParseOptionsRejectsInvalidTraceEvery(t *testing.T) {
 		t.Fatalf("got %v, want trace-every validation error", err)
 	}
 }
+
+func TestApplyTraceKeepsStatisticsWhenSilentHopFirstAnswers(t *testing.T) {
+	m := newModelWithOptions("1.1.1.1", time.Second, defaultTraceConfig(), 1, true)
+	m.hops = []hop{{ttl: 1, sent: 4}}
+	m.applyTrace([]traceResult{{ttl: 1, ip: net.IPv4(192, 168, 0, 1), rtt: 10 * time.Millisecond}})
+
+	h := m.hops[0]
+	if h.ip.String() != "192.168.0.1" || h.sent != 5 || h.received != 1 {
+		t.Fatalf("earlier timeouts were lost when the hop first answered: %+v", h)
+	}
+}
+
+func TestTraceErrorDataTreatsAnyDestinationUnreachableAsEnd(t *testing.T) {
+	data := make([]byte, sockExtendedErrLen+sockaddrInet4Len)
+	data[4] = soEEOriginICMP
+	data[5] = icmpDestUnreachable
+	data[6] = 1 // host unreachable
+	copy(data[sockExtendedErrLen+4:], net.IPv4(10, 0, 0, 1).To4())
+
+	_, reached, ok := parseTraceErrorData(data)
+	if !ok || !reached {
+		t.Fatalf("got ok/reached %t/%t, want true/true", ok, reached)
+	}
+}
+
+func TestTraceTableClipsToNarrowTerminal(t *testing.T) {
+	m := newModelWithOptions("localhost", time.Second, defaultTraceConfig(), 1, true)
+	m.width = 40
+	m.height = 40
+	m.hops = []hop{{ttl: 1, ip: net.IPv4(192, 168, 86, 35), sent: 1, received: 1, latest: 7 * time.Millisecond}}
+
+	for _, line := range strings.Split(strings.TrimSuffix(m.renderTraceTable(), "\n"), "\n") {
+		if got, want := lipgloss.Width(line), m.width-4; got > want {
+			t.Fatalf("line width %d exceeds content width %d: %q", got, want, line)
+		}
+	}
+}
+
+func TestViewShowsTraceErrorOverStaleTable(t *testing.T) {
+	m := newModelWithOptions("localhost", time.Second, defaultTraceConfig(), 1, true)
+	m.hops = []hop{{ttl: 1, ip: net.IPv4(192, 168, 86, 35), sent: 1, received: 1}}
+	m.traceErr = errors.New("resolve \"localhost\": boom")
+
+	view := m.View()
+	if !strings.Contains(view, "TRACE resolve") || strings.Contains(view, "192.168.86.35") {
+		t.Fatalf("view should show the trace error instead of the stale table:\n%s", view)
+	}
+}
