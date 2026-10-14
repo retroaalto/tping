@@ -46,12 +46,17 @@ func (h hop) average() time.Duration {
 	return h.sum / time.Duration(h.received)
 }
 
+var errTimeout = errors.New("timeout")
+
 type traceResult struct {
 	ttl     int
 	ip      net.IP
 	rtt     time.Duration
 	reached bool
 	err     error
+	// fatal marks a local failure (socket, send, or receive) that will repeat
+	// for every TTL, so the sweep stops instead of probing the rest.
+	fatal bool
 }
 
 type traceConfig struct {
@@ -71,7 +76,11 @@ func traceHost(host string, config traceConfig) ([]traceResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return traceSweep(target, config), nil
+	results := traceSweep(target, config)
+	if last := results[len(results)-1]; last.fatal {
+		return nil, last.err
+	}
+	return results, nil
 }
 
 func resolveIPv4(host string) (net.IP, error) {
@@ -92,7 +101,7 @@ func traceSweep(target net.IP, config traceConfig) []traceResult {
 	for ttl := 1; ttl <= config.maxHops; ttl++ {
 		result := traceProbe(target, config, ttl)
 		results = append(results, result)
-		if result.reached {
+		if result.reached || result.fatal {
 			break
 		}
 	}
@@ -104,16 +113,19 @@ func traceProbe(target net.IP, config traceConfig, ttl int) traceResult {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_ICMP)
 	if err != nil {
 		result.err = fmt.Errorf("open ICMP socket: %w", err)
+		result.fatal = true
 		return result
 	}
 	defer syscall.Close(fd)
 
 	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_RECVERR, 1); err != nil {
 		result.err = fmt.Errorf("enable IP_RECVERR: %w", err)
+		result.fatal = true
 		return result
 	}
 	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl); err != nil {
 		result.err = fmt.Errorf("set TTL: %w", err)
+		result.fatal = true
 		return result
 	}
 	timeout := config.timeout
@@ -123,6 +135,7 @@ func traceProbe(target net.IP, config traceConfig, ttl int) traceResult {
 	timeval := syscall.NsecToTimeval(timeout.Nanoseconds())
 	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &timeval); err != nil {
 		result.err = fmt.Errorf("set probe timeout: %w", err)
+		result.fatal = true
 		return result
 	}
 
@@ -132,6 +145,7 @@ func traceProbe(target net.IP, config traceConfig, ttl int) traceResult {
 	started := time.Now()
 	if err := syscall.Sendto(fd, packet, 0, &destination); err != nil {
 		result.err = fmt.Errorf("send probe: %w", err)
+		result.fatal = true
 		return result
 	}
 
@@ -152,16 +166,12 @@ func traceProbe(target net.IP, config traceConfig, ttl int) traceResult {
 		result.reached = true
 		return result
 	}
-	if !errors.Is(receiveErr, syscall.EHOSTUNREACH) && !errors.Is(receiveErr, syscall.ECONNREFUSED) {
-		result.err = errors.New("timeout")
+	if errors.Is(receiveErr, syscall.EAGAIN) || errors.Is(receiveErr, syscall.EINTR) {
+		result.err = errTimeout
 		return result
 	}
 
-	result = readTraceError(fd, ttl, time.Since(started))
-	if result.err != nil {
-		return result
-	}
-	return result
+	return readTraceError(fd, ttl, time.Since(started), receiveErr)
 }
 
 func makeICMPEcho(sequence int) []byte {
@@ -189,13 +199,16 @@ func internetChecksum(packet []byte) uint16 {
 // readTraceError reads the queued error after Recvfrom reports a network error.
 // Linux documents msg_name as the original destination. The responding router is
 // the sockaddr returned by SO_EE_OFFENDER immediately after sock_extended_err.
-func readTraceError(fd, ttl int, rtt time.Duration) traceResult {
+// When no ICMP error is queued, receiveErr was a local failure such as having no
+// route to the network.
+func readTraceError(fd, ttl int, rtt time.Duration, receiveErr error) traceResult {
 	result := traceResult{ttl: ttl}
 	packet := make([]byte, 64)
 	oob := make([]byte, 128)
 	_, oobLength, _, _, err := syscall.Recvmsg(fd, packet, oob, syscall.MSG_ERRQUEUE|syscall.MSG_DONTWAIT)
 	if err != nil {
-		result.err = errors.New("timeout")
+		result.err = fmt.Errorf("receive probe: %w", receiveErr)
+		result.fatal = true
 		return result
 	}
 
@@ -230,8 +243,10 @@ func parseTraceErrorData(data []byte) (net.IP, bool, bool) {
 	if len(data) < sockExtendedErrLen+sockaddrInet4Len || data[4] != soEEOriginICMP {
 		return nil, false, false
 	}
-	icmpType, icmpCode := data[5], data[6]
-	reached := icmpType == icmpDestUnreachable && icmpCode == icmpPortUnreachable
+	icmpType := data[5]
+	// Any destination-unreachable ends the path: port unreachable comes from
+	// the target, other codes from a router that cannot forward further.
+	reached := icmpType == icmpDestUnreachable
 	if icmpType != icmpTimeExceeded && !reached {
 		return nil, false, false
 	}
