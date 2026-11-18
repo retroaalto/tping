@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
 func TestModelRecordsRollingSamples(t *testing.T) {
 	m := newModel("localhost")
+	m.history = maxSamples * m.interval
 	for i := 0; i < maxSamples+3; i++ {
 		var err error
 		if i == maxSamples+2 {
@@ -353,5 +355,214 @@ func TestViewShowsTraceErrorOverStaleTable(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "TRACE resolve") || strings.Contains(view, "192.168.86.35") {
 		t.Fatalf("view should show the trace error instead of the stale table:\n%s", view)
+	}
+}
+
+func TestParseHistory(t *testing.T) {
+	valid := map[string]time.Duration{
+		"5m":    5 * time.Minute,
+		"1h":    time.Hour,
+		"30s":   30 * time.Second,
+		"1h30m": 90 * time.Minute,
+		"10":    10 * time.Minute,
+		"1.5":   90 * time.Second,
+		" 2 ":   2 * time.Minute,
+	}
+	for in, want := range valid {
+		got, err := parseHistory(in)
+		if err != nil || got != want {
+			t.Errorf("parseHistory(%q) = %s, %v; want %s", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "abc", "0", "0s", "-5m", "-1", "inf", "-inf", "nan", "1e30", "5x"} {
+		if got, err := parseHistory(in); err == nil {
+			t.Errorf("parseHistory(%q) = %s, want error", in, got)
+		}
+	}
+}
+
+func TestParseOptionsHistory(t *testing.T) {
+	tests := []struct {
+		args []string
+		want time.Duration
+	}{
+		{[]string{"1.1.1.1"}, 5 * time.Minute},
+		{[]string{"--history", "1h", "1.1.1.1"}, time.Hour},
+		{[]string{"--history=30s", "1.1.1.1"}, 30 * time.Second},
+		{[]string{"-history", "10", "1.1.1.1"}, 10 * time.Minute},
+		{[]string{"-H", "5m", "1.1.1.1"}, 5 * time.Minute},
+		{[]string{"-H", "2", "1.1.1.1"}, 2 * time.Minute},
+	}
+	for _, tt := range tests {
+		options, err := parseOptions(tt.args, &bytes.Buffer{})
+		if err != nil || options.history != tt.want {
+			t.Errorf("parseOptions(%v) history = %s, %v; want %s", tt.args, options.history, err, tt.want)
+		}
+	}
+	for _, bad := range []string{"0", "-1m", "soon"} {
+		if _, err := parseOptions([]string{"-H", bad, "1.1.1.1"}, &bytes.Buffer{}); err == nil {
+			t.Errorf("-H %s: want error", bad)
+		}
+	}
+}
+
+func feedPings(m model, count int) model {
+	for i := 1; i <= count; i++ {
+		updated, _ := m.Update(pingMsg{rtt: time.Duration(i) * time.Millisecond})
+		m = updated.(model)
+	}
+	return m
+}
+
+func press(m model, k tea.KeyMsg) model {
+	updated, _ := m.Update(k)
+	return updated.(model)
+}
+
+func TestHistoryRetainsSamplesForWindow(t *testing.T) {
+	m := feedPings(newModel("localhost"), 305)
+	if len(m.samples) != 300 {
+		t.Fatalf("got %d samples, want 300 (5m at 1s)", len(m.samples))
+	}
+
+	m = newModelWithInterval("localhost", 500*time.Millisecond)
+	m.history = time.Minute
+	m = feedPings(m, 130)
+	if len(m.samples) != 120 {
+		t.Fatalf("got %d samples, want 120 (1m at 0.5s)", len(m.samples))
+	}
+}
+
+func TestScrollKeys(t *testing.T) {
+	m := feedPings(newModel("localhost"), 200) // graph width is 48, so 152 samples can be scrolled back
+	right := tea.KeyMsg{Type: tea.KeyRight}
+	left := tea.KeyMsg{Type: tea.KeyLeft}
+	runes := func(r string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r)} }
+
+	steps := []struct {
+		name string
+		key  tea.KeyMsg
+		want int
+	}{
+		{"right at live stays live", right, 0},
+		{"left", left, 1},
+		{"h", runes("h"), 2},
+		{"l", runes("l"), 1},
+		{"right", right, 0},
+		{"H is a full page", runes("H"), 48},
+		{"shift+left is a full page", tea.KeyMsg{Type: tea.KeyShiftLeft}, 96},
+		{"L is a full page", runes("L"), 48},
+		{"shift+right is a full page", tea.KeyMsg{Type: tea.KeyShiftRight}, 0},
+		{"pgup is a full page", tea.KeyMsg{Type: tea.KeyPgUp}, 48},
+		{"ctrl+left is a full page", tea.KeyMsg{Type: tea.KeyCtrlLeft}, 96},
+		{"ctrl+right is a full page", tea.KeyMsg{Type: tea.KeyCtrlRight}, 48},
+		{"pgdown is a full page", tea.KeyMsg{Type: tea.KeyPgDown}, 0},
+		{"left", left, 1},
+		{"end returns to live", tea.KeyMsg{Type: tea.KeyEnd}, 0},
+	}
+	for _, step := range steps {
+		m = press(m, step.key)
+		if m.offset != step.want {
+			t.Fatalf("%s: offset = %d, want %d", step.name, m.offset, step.want)
+		}
+	}
+
+	for i := 0; i < 10; i++ {
+		m = press(m, runes("H"))
+	}
+	if m.offset != 152 {
+		t.Fatalf("offset = %d, want clamp at 152", m.offset)
+	}
+}
+
+func TestScrollDoesNothingWhenHistoryFitsOnScreen(t *testing.T) {
+	m := feedPings(newModel("localhost"), 10)
+	m = press(m, tea.KeyMsg{Type: tea.KeyLeft})
+	if m.offset != 0 || strings.Contains(m.View(), "ago") {
+		t.Fatalf("scrolled with nothing to scroll to: offset %d", m.offset)
+	}
+}
+
+func TestScrolledGraphShowsOlderSamples(t *testing.T) {
+	m := feedPings(newModel("localhost"), 100) // 1ms..100ms
+	if !strings.Contains(m.renderGraph(), "200ms") {
+		t.Fatal("live graph should be scaled to the newest samples")
+	}
+	if strings.Contains(m.View(), "ago") {
+		t.Fatal("live view should not show the scrolled-back indicator")
+	}
+
+	for i := 0; i < 3; i++ {
+		m = press(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("H")})
+	}
+	if m.offset != 52 {
+		t.Fatalf("offset = %d, want 52", m.offset)
+	}
+	graph := m.renderGraph()
+	if strings.Contains(graph, "200ms") || !strings.Contains(graph, "60ms") {
+		t.Fatalf("scrolled graph should be scaled to samples 1..48ms:\n%s", graph)
+	}
+	if view := m.View(); !strings.Contains(view, "52s ago") || !strings.Contains(view, "End live") {
+		t.Fatalf("view does not show scrolled-back position:\n%s", view)
+	}
+	if !strings.Contains(m.View(), "MAX 100ms") {
+		t.Fatal("footer stats should stay whole-session while scrolled")
+	}
+
+	m = press(m, tea.KeyMsg{Type: tea.KeyEnd})
+	if !strings.Contains(m.renderGraph(), "200ms") {
+		t.Fatal("End should return the graph to live")
+	}
+}
+
+func TestScrolledWindowStaysOnSameMomentAsPingsArrive(t *testing.T) {
+	m := feedPings(newModel("localhost"), 100)
+	m = press(m, tea.KeyMsg{Type: tea.KeyLeft})
+	m = press(m, tea.KeyMsg{Type: tea.KeyLeft})
+	before := m.renderGraph()
+
+	updated, _ := m.Update(pingMsg{rtt: 500 * time.Millisecond})
+	m = updated.(model)
+	if m.offset != 3 {
+		t.Fatalf("offset = %d, want 3 after a new ping", m.offset)
+	}
+	if m.renderGraph() != before {
+		t.Fatal("graph changed while scrolled back")
+	}
+
+	m = press(m, tea.KeyMsg{Type: tea.KeyEnd})
+	updated, _ = m.Update(pingMsg{rtt: time.Millisecond})
+	if updated.(model).offset != 0 {
+		t.Fatal("live view should stay live")
+	}
+}
+
+func TestScrollOffsetFollowsHistoryTrim(t *testing.T) {
+	m := newModel("localhost")
+	m.history = 60 * time.Second
+	m = feedPings(m, 60)
+	m = press(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("H")})
+	if m.offset != 12 { // 60 samples - 48 visible
+		t.Fatalf("offset = %d, want 12", m.offset)
+	}
+	m = feedPings(m, 30)
+	if len(m.samples) != 60 || m.offset != 12 {
+		t.Fatalf("got %d samples, offset %d; want 60 samples, offset clamped to 12", len(m.samples), m.offset)
+	}
+}
+
+func TestScrollOffsetClampsWhenTerminalWidens(t *testing.T) {
+	m := feedPings(newModel("localhost"), 60)
+	m = press(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("H")})
+	m.width = 20 // graph narrows to 16, so more can be scrolled
+	if got := m.maxOffset(); got != 44 {
+		t.Fatalf("maxOffset = %d, want 44", got)
+	}
+	m.width = 200
+	if got := m.scrollOffset(); got != 12 {
+		t.Fatalf("scrollOffset = %d, want 12", got)
+	}
+	if strings.Count(m.renderGraph(), "\n") != graphHeight {
+		t.Fatal("graph should still render after resize")
 	}
 }

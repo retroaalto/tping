@@ -47,6 +47,8 @@ type model struct {
 	traceErr      error
 	noDNS         bool
 	resolving     map[string]bool
+	history       time.Duration
+	offset        int // samples between the newest sample and the graph's right edge
 }
 
 var (
@@ -80,6 +82,7 @@ func newModelWithOptions(host string, interval time.Duration, traceCfg traceConf
 		traceInFlight: traceEvery > 0,
 		noDNS:         noDNS,
 		resolving:     make(map[string]bool),
+		history:       defaultHistory,
 	}
 }
 
@@ -96,6 +99,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if key.Matches(msg, key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"))) {
 			return m, tea.Quit
+		}
+		switch msg.String() {
+		case "left", "h":
+			m.scrollBy(1)
+		case "right", "l":
+			m.scrollBy(-1)
+		case "shift+left", "ctrl+left", "pgup", "H":
+			m.scrollBy(m.graphWidth())
+		case "shift+right", "ctrl+right", "pgdown", "L":
+			m.scrollBy(-m.graphWidth())
+		case "end":
+			m.offset = 0
 		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -134,6 +149,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *model) recordPing(msg pingMsg) {
 	m.total++
 	m.lastErr = msg.err
+	if m.offset > 0 {
+		// Keep the scrolled-back window on the same moment as samples arrive.
+		m.offset++
+	}
 	if msg.err != nil {
 		m.lost++
 		m.samples = append(m.samples, 0)
@@ -149,9 +168,48 @@ func (m *model) recordPing(msg pingMsg) {
 		}
 		m.samples = append(m.samples, msg.rtt)
 	}
-	if len(m.samples) > maxSamples {
-		m.samples = m.samples[len(m.samples)-maxSamples:]
+	if limit := m.capacity(); len(m.samples) > limit {
+		m.samples = m.samples[len(m.samples)-limit:]
 	}
+	m.offset = min(m.offset, m.maxOffset())
+}
+
+// capacity is the number of samples kept to cover the history window.
+func (m model) capacity() int {
+	return max(int(m.history/m.interval), 1)
+}
+
+func (m model) graphWidth() int {
+	return min(max(m.width-4, 10), maxSamples)
+}
+
+func (m model) maxOffset() int {
+	return max(len(m.samples)-m.graphWidth(), 0)
+}
+
+// scrollOffset is m.offset clamped to what the current graph width allows.
+func (m model) scrollOffset() int {
+	return min(m.offset, m.maxOffset())
+}
+
+// scrollBy moves the graph window back in time for positive delta.
+func (m *model) scrollBy(delta int) {
+	m.offset = min(max(m.scrollOffset()+delta, 0), m.maxOffset())
+}
+
+func formatAge(d time.Duration) string {
+	if d >= time.Minute {
+		return d.Round(time.Second).String()
+	}
+	return d.Round(100 * time.Millisecond).String()
+}
+
+func (m model) controls() string {
+	if offset := m.scrollOffset(); offset > 0 {
+		age := formatAge(time.Duration(offset) * m.interval)
+		return warnStyle.Render(fmt.Sprintf("◀ %s ago", age)) + mutedStyle.Render("   End live   q quit")
+	}
+	return mutedStyle.Render(fmt.Sprintf("%s pinging every %s   ←/→ scroll   q quit", m.spinner.View(), m.interval))
 }
 
 func (m *model) applyTrace(results []traceResult) tea.Cmd {
@@ -254,7 +312,7 @@ func (m model) View() string {
 	b.WriteString(mutedStyle.Render("LOST "))
 	b.WriteString(fmt.Sprintf("%d (%.1f%%)", m.lost, m.lossPercent()))
 	b.WriteString("\n\n")
-	b.WriteString(mutedStyle.Render(fmt.Sprintf("%s pinging every %s   q quit", m.spinner.View(), m.interval)))
+	b.WriteString(m.controls())
 	return lipgloss.NewStyle().Padding(1, 2).Render(b.String())
 }
 
@@ -427,17 +485,9 @@ func truncate(value string, width int) string {
 }
 
 func (m model) renderGraph() string {
-	graphWidth := m.width - 4
-	if graphWidth < 10 {
-		graphWidth = 10
-	}
-	if graphWidth > maxSamples {
-		graphWidth = maxSamples
-	}
-	values := m.samples
-	if len(values) > graphWidth {
-		values = values[len(values)-graphWidth:]
-	}
+	graphWidth := m.graphWidth()
+	end := len(m.samples) - m.scrollOffset()
+	values := m.samples[max(end-graphWidth, 0):end]
 	missing := graphWidth - len(values)
 	max := graphMax(values)
 

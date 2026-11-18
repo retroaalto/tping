@@ -19,6 +19,7 @@ go build .        # also works
 go run . 1.1.1.1
 go run . -i 0.5 1.1.1.1
 go run . -max-hops 10 -trace-every 2 -n 1.1.1.1
+go run . --history 1h 1.1.1.1
 ```
 
 Press `q`, `Esc`, or `Ctrl-C` to quit.
@@ -26,6 +27,7 @@ Press `q`, `Esc`, or `Ctrl-C` to quit.
 ### Command-line flags
 
 - `-i SECONDS`: Wait SECONDS between pings (default: 1)
+- `-history DURATION`, `-H DURATION`: How far back the graph can scroll, e.g. `30s`, `5m`, `1h`; a bare number means minutes (default: 5m)
 - `-trace-every N`: Run traceroute sweep every N ping cycles; 0 disables tracing (default: 1)
 - `-max-hops N`: Maximum number of hops in traceroute (default: 30)
 - `-n`: Disable reverse DNS lookup, show IP addresses only
@@ -53,6 +55,7 @@ Before publishing the first release, create a public `retroaalto/homebrew-tping`
 ## Implementation notes
 
 - Bubble Tea model is in `model.go`; `main.go` wires flags and starts the program.
+- History: `recordPing` keeps `history / interval` samples (`model.capacity`). The graph shows a `graphWidth()`-wide window ending `model.offset` samples before the newest. Arrow/`h`/`l` keys move one sample, `H`/`L`/shift+arrows/ctrl+arrows/PgUp/PgDn one page, `End` returns to live. While `offset > 0` each new ping increments it so the window stays put. Footer stats are whole-session and not affected by scrolling. The scrolled-back indicator replaces the controls line so `traceRowsAvailable` is unchanged.
 - Pings use `github.com/go-ping/ping` with `SetPrivileged(false)`, `Count=1`, and a 900 ms timeout.
 - Traceroute uses Linux ICMP datagram sockets with IP_RECVERR to capture ICMP TTL-expired messages (`trace.go`).
 - `main.go` validates exactly one positional host argument and positive numeric flags.

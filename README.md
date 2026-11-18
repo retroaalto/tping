@@ -30,23 +30,37 @@ To build from source instead, you need Go:
 ## Usage
 
 ```sh
-tping [-i seconds] [-trace-every N] [-max-hops N] [-n] <host-or-ip>
+tping [-i seconds] [-history duration] [-trace-every N] [-max-hops N] [-n] <host-or-ip>
 ```
 
 ```sh
 tping 1.1.1.1
 tping -i 0.5 example.com
 tping -n -max-hops 10 1.1.1.1
+tping --history 1h 1.1.1.1
 ```
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `-i SECONDS` | Wait between pings | 1 |
+| `-history DURATION`, `-H DURATION` | How far back the graph can scroll: `30s`, `5m`, `1h`, or a bare number of minutes | 5m |
 | `-trace-every N` | Run a traceroute sweep every N pings; 0 turns tracing off | 1 |
 | `-max-hops N` | Maximum number of hops, 1 to 255 | 30 |
 | `-n` | Skip reverse DNS and show IP addresses only | off |
 
 Press `q`, `Esc`, or `Ctrl-C` to quit.
+
+### Scrolling through history
+
+| Key | Action |
+| --- | --- |
+| `←` / `h` | Scroll back one sample |
+| `→` / `l` | Scroll forward one sample |
+| `Shift+←` / `Ctrl+←` / `PgUp` / `H` | Scroll back one page |
+| `Shift+→` / `Ctrl+→` / `PgDn` / `L` | Scroll forward one page |
+| `End` | Return to the live view |
+
+While scrolled back, the graph stays on the same moment as new pings arrive and the footer shows how far back it is. The min, avg, max, sent and lost figures always cover the whole session.
 
 ## Permissions
 
